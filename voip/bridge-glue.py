@@ -246,8 +246,11 @@ def handle_baresip_event(payload: bytes):
             print(f"[glue] 來電但無待撥號碼(num='{num}' age={age:.0f}s)", flush=True)
 
     # 通話建立: baresip 側 SIP 腿接通。標記 sip_up。
+    # 注意:去電(baresip 收 INCOMING→我方 accept)接聽後 baresip 只發 CALL_RTPESTAB,
+    # 不發 CALL_ESTABLISHED(那是主叫方才有)。故兩者都認,否則去電時 sip_up 永遠 False
+    # → 反向掛斷(安卓掛→iPhone 沒反應)失效。
     # 若此刻處於來電雙響(ringing)→ 代表 iPhone 先接了 mobile-in,要去 Answer 手機來電。
-    if "CALL_ESTABLISHED" in str(etype) or "CALL_ESTABLISHED" in str(klass):
+    if any(k in str(etype) or k in str(klass) for k in ("CALL_ESTABLISHED", "CALL_RTPESTAB")):
         with _slock:
             _state["sip_up"] = True
             ringing = _state["ringing"]
