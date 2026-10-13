@@ -19,8 +19,12 @@
 # 只在通話(SCO PCM 存在)時搬運;SCO 不在時 alsaloop 失敗 → 退避重試。
 set -u
 MAC=A0:B0:BD:1A:BD:C7
+# alsaloop 用 -n(alsa-lib resample) 處理 loopback(固定16k) 與 SCO 原生 rate 的轉換。
+# 不能用 "plug:bluealsa:DEV=..." 前綴(ALSA 無法 parse 帶參數的 plug: device)。
+# SCO codec: CVSD=8kHz(Intel AX201 mSBC over USB 封包損毀,已用 bluealsa --codec=-mSBC
+# 強制 CVSD);-n 讓 16k↔8k 自動轉換,未來換 adapter 回 mSBC 16k 一樣通用。
 SCO="bluealsa:DEV=$MAC,PROFILE=sco"
-RATE=16000; FMT=S16_LE; CH=1
+RATE=16000; FMT=S16_LE; CH=1   # RATE 指 loopback 端(baresip 要 16k);SCO 端由 -n resample
 TLAT=100000   # 目標 latency 100ms(HFP 語音夠用,留餘裕防 xrun)
 SYNC=5        # auto:自動選 captshift/playshift 做時脈同步
 
@@ -28,19 +32,19 @@ log(){ echo "[sco-bridge] $*"; }
 
 uplink(){   # baresip→手機: 讀 loopback 1,0 → 寫 SCO sink
   while :; do
-    alsaloop -C hw:PBLoop,1,0 -P "$SCO" -r $RATE -f $FMT -c $CH -S $SYNC -t $TLAT 2>/dev/null
+    alsaloop -C hw:PBLoop,1,0 -P "$SCO" -r $RATE -n -f $FMT -c $CH -S $SYNC -t $TLAT 2>/dev/null
     sleep 0.5
   done
 }
 downlink(){ # 手機→baresip: 讀 SCO source → 寫 loopback 1,1
   while :; do
-    alsaloop -C "$SCO" -P hw:PBLoop,1,1 -r $RATE -f $FMT -c $CH -S $SYNC -t $TLAT 2>/dev/null
+    alsaloop -C "$SCO" -P hw:PBLoop,1,1 -r $RATE -n -f $FMT -c $CH -S $SYNC -t $TLAT 2>/dev/null
     sleep 0.5
   done
 }
 
 trap 'kill 0' EXIT INT TERM
-log "start (SCO=$MAC, loop=PBLoop, $RATE Hz mSBC, alsaloop sync=$SYNC)"
+log "start (SCO=$MAC, loop=PBLoop, loop=$RATE Hz, SCO codec=CVSD, alsaloop -n resample, sync=$SYNC)"
 uplink &
 downlink &
 wait
