@@ -63,17 +63,36 @@ def ofono_dial(number: str):
         return False
     return True
 
+def get_all_call_paths():
+    """回傳所有 voicecall 物件路徑清單。"""
+    r = subprocess.run([
+        "dbus-send", "--system", "--print-reply",
+        "--dest=org.ofono", OFONO_MODEM,
+        "org.ofono.VoiceCallManager.GetCalls"
+    ], capture_output=True, text=True)
+    return re.findall(r'(/hfp/\S+/voicecall\d+)', r.stdout)
+
 def ofono_hangup_all():
     # 必須帶 --print-reply：否則 dbus-send 是 fire-and-forget，process 會在訊息
     # 真正送達 ofono 前就退出，訊息被丟棄 → exit=0 但手機沒掛(掛斷不同步 bug 真因)。
-    r = subprocess.run([
+    #
+    # 且 VoiceCallManager.HangupAll 只掛得掉 active(已接通)通話；對 dialing/alerting
+    # (去電對方還沒接) 無效 → 必須對每個 VoiceCall 物件下 Hangup。
+    # 策略:先逐一 per-call Hangup(涵蓋 dialing/alerting/active)，再補一次 HangupAll 保險。
+    ok = True
+    for path in get_all_call_paths():
+        r = subprocess.run([
+            "dbus-send", "--system", "--print-reply", "--dest=org.ofono",
+            path, "org.ofono.VoiceCall.Hangup"
+        ], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[glue] hangup {path} failed: {r.stderr.strip()[:160]}", flush=True)
+            ok = False
+    subprocess.run([
         "dbus-send", "--system", "--print-reply", "--dest=org.ofono", OFONO_MODEM,
         "org.ofono.VoiceCallManager.HangupAll"
     ], capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"[glue] ofono hangup failed: {r.stderr.strip()[:200]}", flush=True)
-        return False
-    return True
+    return ok
 
 # ---------- 監聽 oFono 來電 (dbus-monitor) ----------
 def watch_ofono_incoming():
