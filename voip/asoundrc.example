@@ -1,0 +1,30 @@
+# phone-bridge VoIP: 固定 rate 的 snd-aloop PCM,給 baresip 用。
+#
+# 問題:baresip 1.1.0 alsa 模組會用 SIP codec 的 rate 開 ALSA device(PCMU=8k),
+# 忽略 auplay_srate。但 snd-aloop 兩端 rate 必須一致(mover 用 16k),8k 寫入會讓
+# mover 把 8k 當 16k 播 → 對方聽到變調/聽不懂 + 迴音。
+#
+# 解法:plug→rate(強制16000)→hw:PBLoop。無論 baresip 送 8k 或 16k,一律 resample
+# 成 16k 寫進 loopback,loopback 內永遠 16k,與 mover(hw 16k)+SCO(mSBC 16k)全對齊。
+
+# baresip player: 你的聲音 → loopback 0,0 (強制 16k)
+pcm.pb_play {
+    type plug
+    slave {
+        pcm "hw:PBLoop,0,0"
+        rate 16000
+        channels 1
+        format S16_LE
+    }
+}
+
+# baresip source: 對方聲音 ← loopback 0,1 (強制 16k)
+pcm.pb_cap {
+    type plug
+    slave {
+        pcm "hw:PBLoop,0,1"
+        rate 16000
+        channels 1
+        format S16_LE
+    }
+}
