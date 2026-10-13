@@ -72,6 +72,20 @@ def get_all_call_paths():
     ], capture_output=True, text=True)
     return re.findall(r'(/hfp/\S+/voicecall\d+)', r.stdout)
 
+def ofono_answer():
+    """接聽手機來電(對 incoming 的 VoiceCall 下 Answer)。"""
+    ok = False
+    for path in get_all_call_paths():
+        r = subprocess.run([
+            "dbus-send", "--system", "--print-reply", "--dest=org.ofono",
+            path, "org.ofono.VoiceCall.Answer"
+        ], capture_output=True, text=True)
+        if r.returncode == 0:
+            ok = True
+        else:
+            print(f"[glue] answer {path} failed: {r.stderr.strip()[:160]}", flush=True)
+    return ok
+
 def ofono_hangup_all():
     # 必須帶 --print-reply：否則 dbus-send 是 fire-and-forget，process 會在訊息
     # 真正送達 ofono 前就退出，訊息被丟棄 → exit=0 但手機沒掛(掛斷不同步 bug 真因)。
@@ -94,21 +108,67 @@ def ofono_hangup_all():
     ], capture_output=True, text=True)
     return ok
 
-# ---------- 監聽 oFono 來電 (dbus-monitor) ----------
-def watch_ofono_incoming():
-    """輪詢 oFono GetCalls，手機來電(incoming)時叫 baresip 撥 iPhone。
-    用輪詢而非 dbus-monitor（後者 BecomeMonitor 需 root 權限）。"""
-    print("[glue] polling oFono for incoming calls", flush=True)
+# ---------- 通話協調狀態 ----------
+# 來電雙響「誰先接誰贏」+ 掛斷雙向同步共用這組狀態。
+# 模型:同時最多一通。sip_up=iPhone 那條 SIP 腿是否建立;ringing=來電雙響等人接。
+_state = {
+    "ringing": False,      # 手機來電→已撥 iPhone,雙方都在響,等誰先接
+    "sip_up": False,       # baresip(iPhone)側通話已建立(ESTABLISHED 後、CLOSED 前)
+    "answered_mobile": False,  # 我們已對手機來電下過 Answer(避免重複)
+}
+_slock = threading.Lock()
+
+def baresip_hangup():
+    baresip_cmd("hangup")
+
+# ---------- 監聽 oFono 通話 (輪詢 GetCalls) ----------
+def watch_ofono_calls():
+    """輪詢 oFono，處理三件事:
+    1. 手機來電(incoming) → 撥 iPhone(mobile-in) 一起響(手機本身也響);標記 ringing。
+    2. 來電被手機端先接(incoming→active 但不是我們 Answer 的) → 掛掉 iPhone 響鈴腿。
+    3. 手機側通話消失(對方掛/蜂窩斷) → 若 SIP 腿還在,掛掉 iPhone 腿(反向掛斷同步)。
+    用輪詢而非 dbus-monitor(後者 BecomeMonitor 需 root)。"""
+    print("[glue] polling oFono call states", flush=True)
     known = {}  # call_path -> state
     while True:
         calls = get_all_calls()
-        # 新出現且 incoming 的通話 → 轉給 iPhone
+
+        # (1) 新的 incoming 手機來電 → 響 iPhone
         for path, state in calls.items():
             if path not in known and state == "incoming":
-                print(f"[glue] oFono incoming call {path} → ring iPhone", flush=True)
+                print(f"[glue] 手機來電 {path} → 同時響 iPhone(誰先接誰贏)", flush=True)
+                with _slock:
+                    _state["ringing"] = True
+                    _state["answered_mobile"] = False
                 baresip_cmd("dial", f"sip:mobile-in@{ASTERISK}")
+
+        # (2) 來電期間通話變 active,但不是我們 Answer 的 → 手機端先接 → 掛 iPhone 響鈴
+        with _slock:
+            ringing = _state["ringing"]
+            answered = _state["answered_mobile"]
+        if ringing and not answered:
+            for path, state in calls.items():
+                if state == "active" and known.get(path) == "incoming":
+                    print("[glue] 手機端先接 → 掛掉 iPhone 響鈴腿", flush=True)
+                    baresip_hangup()
+                    with _slock:
+                        _state["ringing"] = False
+
+        # (3) 反向掛斷同步:上輪有、這輪消失的手機通話 → 掛 SIP 腿
+        gone = [p for p in known if p not in calls]
+        if gone:
+            with _slock:
+                sip_up = _state["sip_up"]
+                ringing = _state["ringing"]
+            if sip_up or ringing:
+                print(f"[glue] 手機側通話消失 {gone} → 同步掛斷 iPhone/SIP 腿", flush=True)
+                baresip_hangup()
+            with _slock:
+                _state["ringing"] = False
+                _state["answered_mobile"] = False
+
         known = calls
-        time.sleep(1)
+        time.sleep(0.5)
 
 def get_all_calls():
     """回傳 {call_path: state}。"""
@@ -185,10 +245,33 @@ def handle_baresip_event(payload: bytes):
         else:
             print(f"[glue] 來電但無待撥號碼(num='{num}' age={age:.0f}s)", flush=True)
 
+    # 通話建立: baresip 側 SIP 腿接通。標記 sip_up。
+    # 若此刻處於來電雙響(ringing)→ 代表 iPhone 先接了 mobile-in,要去 Answer 手機來電。
+    if "CALL_ESTABLISHED" in str(etype) or "CALL_ESTABLISHED" in str(klass):
+        with _slock:
+            _state["sip_up"] = True
+            ringing = _state["ringing"]
+        if ringing:
+            print("[glue] iPhone 先接來電 → Answer 手機來電並橋接", flush=True)
+            with _slock:
+                _state["answered_mobile"] = True
+                _state["ringing"] = False
+            ofono_answer()
+
     # 掛斷(iPhone 掛掉 → SIP 側 CALL_CLOSED): 同步叫 ofono 掛手機,否則手機通話卡到 timeout
     if "CALL_CLOSED" in str(etype) or "CALL_CLOSED" in str(klass):
-        print("[glue] SIP 通話結束 → ofono 掛斷手機", flush=True)
-        ofono_hangup_all()
+        with _slock:
+            _state["sip_up"] = False
+            ringing = _state["ringing"]
+        # 來電雙響期間 iPhone 側腿關閉(iPhone 拒接/響鈴逾時):只是放棄 iPhone,
+        # 不要掛手機來電(手機可能還在響、使用者可能想在手機上接)。僅清 ringing。
+        if ringing:
+            print("[glue] iPhone 側響鈴結束(拒接/逾時) → 保留手機來電,僅清 ringing", flush=True)
+            with _slock:
+                _state["ringing"] = False
+        else:
+            print("[glue] SIP 通話結束 → ofono 掛斷手機", flush=True)
+            ofono_hangup_all()
 
 # ---------- HTTP endpoint: Asterisk 撥號前告知目標號碼 ----------
 class GlueHTTP(BaseHTTPRequestHandler):
@@ -213,7 +296,7 @@ def run_http():
 
 if __name__ == "__main__":
     print("[glue] bridge-glue 啟動", flush=True)
-    t1 = threading.Thread(target=watch_ofono_incoming, daemon=True)
+    t1 = threading.Thread(target=watch_ofono_calls, daemon=True)
     t2 = threading.Thread(target=watch_baresip_events, daemon=True)
     t3 = threading.Thread(target=run_http, daemon=True)
     t1.start(); t2.start(); t3.start()
