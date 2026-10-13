@@ -121,6 +121,16 @@ _slock = threading.Lock()
 def baresip_hangup():
     baresip_cmd("hangup")
 
+def baresip_active_calls() -> int:
+    """查 baresip 目前 active call 數(ctrl_tcp listcalls)。
+    比追蹤 CALL_* 事件維護旗標可靠(去電時 baresip 不發 ESTABLISHED/RTPESTAB,
+    只發 CALL_RTCP,事件追蹤會漏)。回 -1 表查詢失敗。"""
+    resp = baresip_cmd("listcalls")
+    if not resp:
+        return -1
+    m = re.search(r"Active calls \((\d+)\)", resp.decode(errors="ignore"))
+    return int(m.group(1)) if m else -1
+
 # ---------- 監聽 oFono 通話 (輪詢 GetCalls) ----------
 def watch_ofono_calls():
     """輪詢 oFono，處理三件事:
@@ -154,16 +164,19 @@ def watch_ofono_calls():
                     with _slock:
                         _state["ringing"] = False
 
-        # (3) 反向掛斷同步:上輪有、這輪消失的手機通話 → 掛 SIP 腿
+        # (3) 反向掛斷同步:上輪有、這輪消失的手機通話 → 若 baresip 還有通話,掛掉 iPhone/SIP 腿。
+        # 用 listcalls 實查 baresip(不靠 sip_up 事件旗標,去電時 baresip 不發 ESTABLISHED
+        # 會漏設)。ringing 也一併處理(來電雙響期間手機來電消失 → 收掉 iPhone 響鈴)。
         gone = [p for p in known if p not in calls]
         if gone:
             with _slock:
-                sip_up = _state["sip_up"]
                 ringing = _state["ringing"]
-            if sip_up or ringing:
-                print(f"[glue] 手機側通話消失 {gone} → 同步掛斷 iPhone/SIP 腿", flush=True)
+            active = baresip_active_calls()
+            if active > 0 or ringing:
+                print(f"[glue] 手機側通話消失 {gone} (baresip active={active}) → 掛斷 iPhone/SIP 腿", flush=True)
                 baresip_hangup()
             with _slock:
+                _state["sip_up"] = False
                 _state["ringing"] = False
                 _state["answered_mobile"] = False
 
