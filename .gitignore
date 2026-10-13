@@ -1,0 +1,10 @@
+# 機密 — 絕不提交
+*.env
+.secrets.env
+config.env
+*.pwd
+*.wav
+*.mp3
+.state.json
+__pycache__/
+*.pyc
