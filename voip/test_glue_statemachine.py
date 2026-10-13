@@ -2,6 +2,7 @@
 """狀態機單元測試:驗證 bridge-glue 的來電雙響搶接 + 反向掛斷邏輯(不碰真實連線)。
 以 monkeypatch 取代 baresip_hangup/ofono_hangup_all/ofono_answer/baresip_active_calls,
 記錄呼叫序列,斷言 C2 競態等情境行為正確。"""
+import time
 import importlib.util, sys, types, time
 
 # 載入 bridge-glue 模組(不執行 main)
@@ -22,7 +23,7 @@ def reset():
     with glue._slock:
         glue._state["ringing"] = False
         glue._state["answered_mobile"] = False
-        glue._state["expect_sip_close"] = False
+        glue._state["expect_until"] = 0.0
         glue._state["need_reconcile"] = False
 
 fails = 0
@@ -41,12 +42,12 @@ with glue._slock:
 # 模擬輪詢偵測「手機端先接」:設 expect_sip_close + 掛 iPhone 腿(鎖內決策)
 with glue._slock:
     glue._state["ringing"] = False
-    glue._state["expect_sip_close"] = True
+    glue._state["expect_until"] = time.time() + glue.EXPECT_WINDOW
 glue.baresip_hangup()
 # baresip 隨後回 CALL_CLOSED
 glue.handle_baresip_event({"event": True, "type": "CALL_CLOSED", "class": "call", "param": "normal"})
 check("CALL_CLOSED 後沒有 ofono_hangup_all(沒掛掉手機通話)", "ofono_hangup_all" not in calls_log)
-check("expect_sip_close 已清旗標", glue._state["expect_sip_close"] is False)
+check("expect_sip_close 已清旗標", glue._state["expect_until"] == 0.0)
 
 # ===== 情境 2:iPhone 掛斷(正常去電結束)→ 必須掛手機 =====
 print("情境2:iPhone 掛斷 → 要掛手機")
@@ -89,6 +90,28 @@ with glue._plock:
         num, ts = q[0]
         q[0] = (num, ts - glue.PENDING_TTL - 1)
 check("逾時號碼不回傳", glue.pending_get() is None)
+
+# ===== 情境 6:M-B 旗標衛生 — 遺失 CALL_CLOSED 後,下一通去電必須掛手機 =====
+# 模擬:expect_until 被設成未來(上一通我方掛 iPhone 腿,但那則 CALL_CLOSED 遺失 → 黏滯)。
+# 新去電 CALL_INCOMING 必須重置 expect_until → 這通結束的 CALL_CLOSED 才會正確掛手機。
+print("情境6:M-B 遺失 CALL_CLOSED → 去電重置旗標 → 結束時掛手機(防持續計費)")
+reset()
+with glue._slock:
+    glue._state["expect_until"] = time.time() + 999   # 黏滯(模擬遺失 CLOSED)
+glue.pending_put("123")
+glue.handle_baresip_event({"event": True, "type": "CALL_INCOMING", "class": "call", "param": ""})
+check("去電 CALL_INCOMING 重置了黏滯的 expect_until", glue._state["expect_until"] == 0.0)
+# 這通去電結束
+glue.handle_baresip_event({"event": True, "type": "CALL_CLOSED", "class": "call", "param": "normal"})
+check("去電結束 CALL_CLOSED 正確掛手機(未被黏滯旗標誤判為預期)", "ofono_hangup_all" in calls_log)
+
+# ===== 情境 7:expect_until 時效 — 逾時的預期視窗不再擋掛機 =====
+print("情境7:expect_until 逾時 → CALL_CLOSED 視為真掛,掛手機")
+reset()
+with glue._slock:
+    glue._state["expect_until"] = time.time() - 1   # 已過期
+glue.handle_baresip_event({"event": True, "type": "CALL_CLOSED", "class": "call", "param": "normal"})
+check("過期 expect_until 不擋掛機", "ofono_hangup_all" in calls_log)
 
 print()
 print(f"=== 結果:{'全過 ✓' if fails == 0 else str(fails) + ' 個 FAIL ✗'} ===")

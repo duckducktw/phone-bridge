@@ -19,8 +19,9 @@ bridge-glue: 連接 baresip(SIP) 與 oFono(手機HFP) 的撥號膠水。
   三條 thread(oFono 輪詢 / baresip 事件 / HTTP)共用 _state,所有「讀狀態→決策→
   改狀態」都在單一 _slock 區段內完成,避免 TOCTOU。來電雙響「手機端先接」時掛 iPhone
   響鈴腿,會讓 baresip 送 CALL_CLOSED;為避免該 CLOSED 回頭觸發 ofono_hangup_all()
-  把剛接通的手機通話掛掉,用一次性旗標 _state['expect_sip_close'] 讓 CLOSED handler
-  認得「這次 SIP 腿關閉是我方預期的、別掛手機」。
+  把剛接通的手機通話掛掉,用帶時效的時間戳 _state['expect_until'] 讓 CLOSED handler
+  認得「這次 SIP 腿關閉是我方預期的、別掛手機」;時效(5s)過後自動失效,避免遺失的
+  CLOSED 讓旗標黏滯到下一通去電而漏掛手機(持續計費)。
 """
 import os, socket, json, time, threading, subprocess, sys, re
 from collections import deque
@@ -54,7 +55,8 @@ class BaresipCtrl:
         self.lock = threading.Lock()       # 保護 sock 寫入 + 連線重建
         self.resp_lock = threading.Lock()
         self.resp_cond = threading.Condition(self.resp_lock)
-        self.responses = {}                # token -> decoded response dict
+        self.responses = {}                # token -> decoded response dict(只存有人等的)
+        self._waiters = set()              # 正在等回應的 token;非等待中的 response 直接丟棄
         self._tok = 0
         self.connected = threading.Event()
 
@@ -97,6 +99,9 @@ class BaresipCtrl:
                         try: self.sock.close()
                         except Exception: pass
                         self.sock = None
+                # 喚醒所有等待中的 cmd,讓它們立即失敗(不必空等到各自 timeout)
+                with self.resp_cond:
+                    self.resp_cond.notify_all()
                 buf = b""
                 time.sleep(3)
 
@@ -123,8 +128,11 @@ class BaresipCtrl:
         if msg.get("response") is True:
             tok = msg.get("token", "")
             with self.resp_cond:
-                self.responses[tok] = msg
-                self.resp_cond.notify_all()
+                # 只保留有人等的 token 的回應;其餘(want_response=False 的命令回應)直接丟棄,
+                # 避免 responses dict 在熱路徑(dial/accept/hangup)無界洩漏。
+                if tok in self._waiters:
+                    self.responses[tok] = msg
+                    self.resp_cond.notify_all()
         elif msg.get("event") is True:
             handle_baresip_event(msg)
 
@@ -144,13 +152,18 @@ class BaresipCtrl:
                 return None
         if not want_response:
             return None
+        with self.resp_cond:
+            self._waiters.add(tok)
         deadline = time.time() + timeout
         with self.resp_cond:
             while tok not in self.responses:
                 remaining = deadline - time.time()
                 if remaining <= 0:
+                    self._waiters.discard(tok)
+                    self.responses.pop(tok, None)   # 清掉可能遲到塞入的
                     return None
                 self.resp_cond.wait(remaining)
+            self._waiters.discard(tok)
             return self.responses.pop(tok)
 
 _ctrl = BaresipCtrl(BARESIP_CTRL)
@@ -173,78 +186,68 @@ def baresip_active_calls() -> int:
     return int(m.group(1)) if m else -1
 
 # ---------- oFono via dbus-send ----------
+def _dbus(dest_path: str, method: str, *args, timeout: float = 5.0):
+    """統一的 dbus-send 呼叫:一律帶 --print-reply(否則 fire-and-forget,訊息可能在送達
+    ofono 前就隨 process 退出被丟棄),且帶 timeout(ofono/BlueZ 卡住時不讓呼叫線程無限阻塞,
+    預設 dbus-send 要 ~25s 才超時 → reader 線程會假死)。回 (rc, stdout);逾時回 (-1, "")。"""
+    cmd = ["dbus-send", "--system", "--print-reply", "--dest=org.ofono", dest_path, method] + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        print(f"[glue] dbus 逾時({timeout}s): {method}", flush=True)
+        return -1, "", "timeout"
+    except Exception as e:
+        print(f"[glue] dbus 例外: {method}: {e}", flush=True)
+        return -1, "", str(e)
+
 def ofono_dial(number: str):
     """用 oFono 叫手機撥號。"""
     print(f"[glue] ofono dial {number}", flush=True)
-    r = subprocess.run([
-        "dbus-send", "--system", "--print-reply",
-        "--dest=org.ofono", OFONO_MODEM,
-        "org.ofono.VoiceCallManager.Dial",
-        f"string:{number}", "string:default"
-    ], capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"[glue] ofono dial failed: {r.stderr.strip()[:200]}", flush=True)
+    rc, _, err = _dbus(OFONO_MODEM, "org.ofono.VoiceCallManager.Dial",
+                       f"string:{number}", "string:default")
+    if rc != 0:
+        print(f"[glue] ofono dial failed: {err.strip()[:200]}", flush=True)
         return False
     return True
 
 def get_all_call_paths():
     """回傳所有 voicecall 物件路徑清單。"""
-    r = subprocess.run([
-        "dbus-send", "--system", "--print-reply",
-        "--dest=org.ofono", OFONO_MODEM,
-        "org.ofono.VoiceCallManager.GetCalls"
-    ], capture_output=True, text=True)
-    if r.returncode != 0:
+    rc, out, _ = _dbus(OFONO_MODEM, "org.ofono.VoiceCallManager.GetCalls")
+    if rc != 0:
         return []
-    return re.findall(r'(/hfp/\S+/voicecall\d+)', r.stdout)
+    return re.findall(r'(/hfp/\S+/voicecall\d+)', out)
 
 def ofono_answer():
     """接聽手機來電(對 incoming 的 VoiceCall 下 Answer)。"""
     ok = False
     for path in get_all_call_paths():
-        r = subprocess.run([
-            "dbus-send", "--system", "--print-reply", "--dest=org.ofono",
-            path, "org.ofono.VoiceCall.Answer"
-        ], capture_output=True, text=True)
-        if r.returncode == 0:
+        rc, _, err = _dbus(path, "org.ofono.VoiceCall.Answer")
+        if rc == 0:
             ok = True
         else:
-            print(f"[glue] answer {path} failed: {r.stderr.strip()[:160]}", flush=True)
+            print(f"[glue] answer {path} failed: {err.strip()[:160]}", flush=True)
     return ok
 
 def ofono_hangup_all():
-    # 必須帶 --print-reply：否則 dbus-send 是 fire-and-forget，process 會在訊息
-    # 真正送達 ofono 前就退出，訊息被丟棄 → exit=0 但手機沒掛(掛斷不同步 bug 真因)。
-    #
-    # 且 VoiceCallManager.HangupAll 只掛得掉 active(已接通)通話；對 dialing/alerting
-    # (去電對方還沒接) 無效 → 必須對每個 VoiceCall 物件下 Hangup。
+    # 必須帶 --print-reply(見 _dbus)。且 VoiceCallManager.HangupAll 只掛得掉 active(已接通)
+    # 通話；對 dialing/alerting(去電對方還沒接) 無效 → 必須對每個 VoiceCall 物件下 Hangup。
     # 策略:先逐一 per-call Hangup(涵蓋 dialing/alerting/active)，再補一次 HangupAll 保險。
     ok = True
     for path in get_all_call_paths():
-        r = subprocess.run([
-            "dbus-send", "--system", "--print-reply", "--dest=org.ofono",
-            path, "org.ofono.VoiceCall.Hangup"
-        ], capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"[glue] hangup {path} failed: {r.stderr.strip()[:160]}", flush=True)
+        rc, _, err = _dbus(path, "org.ofono.VoiceCall.Hangup")
+        if rc != 0:
+            print(f"[glue] hangup {path} failed: {err.strip()[:160]}", flush=True)
             ok = False
-    subprocess.run([
-        "dbus-send", "--system", "--print-reply", "--dest=org.ofono", OFONO_MODEM,
-        "org.ofono.VoiceCallManager.HangupAll"
-    ], capture_output=True, text=True)
+    _dbus(OFONO_MODEM, "org.ofono.VoiceCallManager.HangupAll")
     return ok
 
 def get_all_calls():
     """回傳 {call_path: state}；dbus 查詢失敗回 None(區分「查詢失敗」與「真的沒通話」,
     避免瞬時失敗被當成通話消失而誤掛健在通話)。"""
-    r = subprocess.run([
-        "dbus-send", "--system", "--print-reply",
-        "--dest=org.ofono", OFONO_MODEM,
-        "org.ofono.VoiceCallManager.GetCalls"
-    ], capture_output=True, text=True)
-    if r.returncode != 0:
+    rc, out, _ = _dbus(OFONO_MODEM, "org.ofono.VoiceCallManager.GetCalls")
+    if rc != 0:
         return None
-    out = r.stdout
     calls = {}
     cur = None
     for m in re.finditer(r'object path "([^"]+)"|string "State"\s+variant\s+string "(\w+)"', out):
@@ -259,10 +262,13 @@ def get_all_calls():
 _state = {
     "ringing": False,          # 手機來電→已撥 iPhone,雙方都在響,等誰先接
     "answered_mobile": False,  # 我們已對手機來電下過 Answer(iPhone 先接的情形)
-    "expect_sip_close": False, # 我方主動掛了 iPhone 響鈴腿,預期隨之而來的 CALL_CLOSED
-                               # 不該觸發 ofono_hangup_all(否則掛掉剛在手機上接的通話)
+    "expect_until": 0.0,       # 我方主動掛 iPhone 腿後,此時刻前到來的 CALL_CLOSED 視為「預期」,
+                               # 不觸發 ofono_hangup_all(否則掛掉剛在手機上接的通話)。用時間戳
+                               # 而非永久 bool:若那則 CALL_CLOSED 遺失,旗標會自動逾時失效,不會
+                               # 黏滯到「下一通去電結束時誤判為預期 → 不掛手機 → 持續計費」。
     "need_reconcile": False,   # ctrl_tcp (重)連上 → 請輪詢線程在鎖外補一次狀態收斂
 }
+EXPECT_WINDOW = 5.0            # expect_until 時效(秒)
 _slock = threading.Lock()
 
 def on_ctrl_connected():
@@ -309,7 +315,7 @@ def _watch_ofono_calls():
                 with _slock:
                     _state["ringing"] = False
                     _state["answered_mobile"] = False
-                    _state["expect_sip_close"] = False
+                    _state["expect_until"] = 0.0
                 print("[glue] ctrl_tcp 連線對帳:baresip 無通話,狀態已收斂", flush=True)
 
         calls = get_all_calls()
@@ -324,11 +330,11 @@ def _watch_ofono_calls():
                 with _slock:
                     _state["ringing"] = True
                     _state["answered_mobile"] = False
-                    _state["expect_sip_close"] = False
+                    _state["expect_until"] = 0.0
                 baresip_cmd("dial", f"sip:mobile-in@{ASTERISK}", read_response=False)
 
         # (2) 來電期間某通 incoming→active 且非我方 Answer → 手機端先接 → 掛 iPhone 響鈴腿。
-        #     整段決策在單一鎖區內完成(讀 ringing/answered → 設 expect_sip_close/清 ringing),
+        #     整段決策在單一鎖區內完成(讀 ringing/answered → 設 expect_until/清 ringing),
         #     消除 TOCTOU;baresip_hangup() 在鎖外呼叫(避免持鎖做網路 I/O)但旗標已先落定。
         mobile_answered = any(
             state == "active" and known.get(path) == "incoming"
@@ -339,7 +345,7 @@ def _watch_ofono_calls():
             if _state["ringing"] and not _state["answered_mobile"] and mobile_answered:
                 print("[glue] 手機端先接 → 掛掉 iPhone 響鈴腿(預期 CALL_CLOSED,不掛手機)", flush=True)
                 _state["ringing"] = False
-                _state["expect_sip_close"] = True
+                _state["expect_until"] = time.time() + EXPECT_WINDOW
                 do_hangup_sip = True
         if do_hangup_sip:
             baresip_hangup()
@@ -353,17 +359,21 @@ def _watch_ofono_calls():
                 gone_count.pop(path, None)
         confirmed_gone = [p for p, c in gone_count.items() if c >= GONE_CONFIRM]
         if confirmed_gone:
+            # 先在鎖外查 baresip(走 _ctrl.lock,不可在 _slock 內呼叫),再進單鎖區決策。
+            active = baresip_active_calls()
+            do_hangup = False
             with _slock:
                 ringing = _state["ringing"]
-            active = baresip_active_calls()
-            if active > 0 or ringing:
-                print(f"[glue] 手機側通話消失 {confirmed_gone} (baresip active={active}) → 掛斷 iPhone/SIP 腿", flush=True)
-                with _slock:
-                    _state["expect_sip_close"] = True   # 這次 SIP 關閉是我方發起的
-                baresip_hangup()
-            with _slock:
+                # active != 0 涵蓋 >0(確有通話)與 -1(查詢失敗,不確定時偏向掛斷,
+                # 寧可多掛也別留著 SIP 腿空耗);ringing 時也要收掉 iPhone 響鈴。
+                if active != 0 or ringing:
+                    _state["expect_until"] = time.time() + EXPECT_WINDOW  # 我方發起的關閉
+                    do_hangup = True
                 _state["ringing"] = False
                 _state["answered_mobile"] = False
+            if do_hangup:
+                print(f"[glue] 手機側通話消失 {confirmed_gone} (baresip active={active}) → 掛斷 iPhone/SIP 腿", flush=True)
+                baresip_hangup()
             for p in confirmed_gone:
                 gone_count.pop(p, None)
 
@@ -389,6 +399,12 @@ def handle_baresip_event(ev: dict):
     if "CALL_INCOMING" in str(etype) or "CALL_INCOMING" in str(klass):
         num = pending_get()
         if num:
+            # 每通新去電開始先重置協調旗標:避免上一通遺失的 CALL_CLOSED 讓 expect_until
+            # 黏滯,導致這通去電結束時被誤判為「預期關閉」→ 不掛手機 → 持續計費。
+            with _slock:
+                _state["ringing"] = False
+                _state["answered_mobile"] = False
+                _state["expect_until"] = 0.0
             print(f"[glue] iPhone→撥外線 {num}", flush=True)
             baresip_cmd("accept", read_response=False)  # baresip 接(建立 SIP 音訊到 iPhone)
             time.sleep(0.5)
@@ -412,13 +428,13 @@ def handle_baresip_event(ev: dict):
             ofono_answer()
 
     # 掛斷(SIP 側 CALL_CLOSED): 決定是否同步掛手機。
-    # 若 expect_sip_close(我方剛主動掛 iPhone 腿:手機端先接、或反向掛斷已處理)→ 只清旗標,
-    # 絕不 ofono_hangup_all(否則把剛在手機上接的通話掛掉 — C2 競態)。
+    # 若在 expect_until 時限內(我方剛主動掛 iPhone 腿:手機端先接、或反向掛斷已處理)→ 只清旗標,
+    # 絕不 ofono_hangup_all(否則把剛在手機上接的通話掛掉 — C2 競態)。時限外則視為 iPhone 真掛。
     if "CALL_CLOSED" in str(etype) or "CALL_CLOSED" in str(klass):
         with _slock:
-            expected = _state["expect_sip_close"]
+            expected = time.time() < _state["expect_until"]
             ringing = _state["ringing"]
-            _state["expect_sip_close"] = False
+            _state["expect_until"] = 0.0
             _state["answered_mobile"] = False
             if ringing or expected:
                 _state["ringing"] = False
