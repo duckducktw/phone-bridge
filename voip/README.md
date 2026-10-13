@@ -62,9 +62,32 @@ systemctl --user restart wireplumber
 
 ### baresip config（`~/.baresip/config`）
 ```
-audio_player   alsa,hw:PBLoop,0,0
-audio_source   alsa,hw:PBLoop,0,1
+audio_player   alsa,pb_play
+audio_source   alsa,pb_cap
 ```
+
+## 上行斷、對方聽不到你（Intel AX201 mSBC-over-USB 坑）
+
+**症狀**：iPhone 聽得到對方（下行 OK），但對方聽不到你（上行斷）。對方喇叭懟著聽「有震但人耳難辨」。
+
+**真因**：手機協商 **mSBC 寬頻語音**，但 **Intel AX201 + btusb 對 mSBC transparent SCO over USB 傳輸有 bug** → `dmesg` 狂噴 `corrupted SCO packet` + `hciconfig` TX errors 暴增 → 上行音訊封包損毀。bluez-alsa 維護者 arkq 證實：「mSBC over USB 上行串流本就不可靠」。這是硬體/驅動層，不是音訊管線。
+
+**定位法**（硬證據，不靠猜）：
+- `hciconfig hci0` 的 `sco:N` = SCO TX 封包計數。送音訊到 SCO sink 時 N 應增長 → 確認音訊有無飛向手機。
+- `dmesg | grep "corrupted SCO"` → mSBC-over-USB 損毀鐵證。
+- 攔截 `hw:PBLoop,1,0`（baresip 送往 SCO 前）錄音算 RMS → 確認你的聲音有無到 loopback。
+
+**修法：強制 CVSD**（窄頻 8kHz，走標準 SCO、不需 transparent air mode，Intel AX201 穩定，corrupted=0 實測）：
+```bash
+# 1. bluealsa 停用 mSBC/LC3（override 已在 systemd/bluealsa-override.conf）
+#    ExecStart=... -p hfp-ofono --codec=-mSBC --codec=-LC3-SWB
+# 2. btmgmt 關 WBS（開機持久化 → systemd/phone-wbs-off.service, enable 到 bluetooth.target）
+#    btmgmt power off; btmgmt wbs off; btmgmt power on
+# 3. sco-bridge.sh 的 alsaloop 加 -n（alsa-lib resample）處理 loopback 16k ↔ SCO 8k
+sudo systemctl restart bluealsa; sudo systemctl restart ofono; bluetoothctl connect <MAC>
+```
+注意：`btmgmt wbs off` 對 oFono 2.18 的 codec 協商無效（oFono 自己宣告 mSBC），**真正降 CVSD 靠 bluealsa `--codec=-mSBC`**。
+注意：alsaloop **不能**用 `plug:bluealsa:DEV=...` 前綴（ALSA 無法 parse 帶參數的 `plug:` device），要用 `-n`。
 
 ## 首次部署
 

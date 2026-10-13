@@ -1,0 +1,14 @@
+[Unit]
+Description=phone-bridge SCO<->loopback audio bridge (baresip full-duplex workaround)
+After=bluealsa.service sound.target
+Wants=bluealsa.service
+
+[Service]
+Type=simple
+# 用 sg audio 取得 audio 群組(存取 BlueALSA SCO + loopback hw:PBLoop)
+ExecStart=/usr/bin/sg audio -c "/usr/bin/bash %h/projects/phone-bridge/voip/sco-bridge.sh"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

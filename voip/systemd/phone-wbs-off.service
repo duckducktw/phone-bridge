@@ -1,0 +1,15 @@
+[Unit]
+Description=Disable Bluetooth Wideband Speech (force CVSD for phone-bridge HFP, Intel AX201 mSBC-over-USB broken)
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# power off → set wbs off → power on (btmgmt 需 adapter power off 才能改)
+ExecStart=/usr/bin/btmgmt power off
+ExecStart=/usr/bin/btmgmt wbs off
+ExecStart=/usr/bin/btmgmt power on
+
+[Install]
+WantedBy=bluetooth.target
