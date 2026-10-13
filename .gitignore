@@ -1,5 +1,7 @@
 # 機密 — 絕不提交
 *.env
+# 由 render-config.sh 從範本+secrets 生成，含明文 SIP 密碼
+voip/asterisk/pjsip.conf
 .secrets.env
 config.env
 *.pwd

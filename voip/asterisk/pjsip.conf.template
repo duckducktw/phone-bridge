@@ -1,0 +1,49 @@
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5060
+
+[endpoint-tpl](!)
+type=endpoint
+context=from-internal
+disallow=all
+allow=ulaw
+allow=alaw
+allow=g722
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[auth-tpl](!)
+type=auth
+auth_type=userpass
+
+[aor-tpl](!)
+type=aor
+max_contacts=1
+remove_existing=yes
+
+; --- 6001 baresip (HFP 橋) ---
+[6001](endpoint-tpl)
+auth=6001-auth
+aors=6001
+callerid=HFP Bridge <6001>
+
+[6001-auth](auth-tpl)
+username=6001
+password=__SIP_BARESIP_PASS__
+
+[6001](aor-tpl)
+
+; --- 6002 iPhone ---
+[6002](endpoint-tpl)
+auth=6002-auth
+aors=6002
+callerid=iPhone <6002>
+
+[6002-auth](auth-tpl)
+username=6002
+password=__SIP_IPHONE_PASS__
+
+[6002](aor-tpl)

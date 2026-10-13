@@ -1,0 +1,9 @@
+services:
+  asterisk:
+    image: andrius/asterisk:latest
+    container_name: phone-bridge-asterisk
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
