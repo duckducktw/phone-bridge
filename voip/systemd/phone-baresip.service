@@ -1,0 +1,14 @@
+[Unit]
+Description=baresip HFP bridge (ext 6001)
+After=bluealsa.service sound.target phone-sco-bridge.service
+Wants=phone-sco-bridge.service
+
+[Service]
+Type=simple
+# 用 sg audio 取得 audio 群組(user 已加入但當前 session 未重載群組)
+ExecStart=/usr/bin/sg audio -c "/usr/bin/baresip"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

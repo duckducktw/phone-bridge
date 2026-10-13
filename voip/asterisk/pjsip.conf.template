@@ -1,7 +1,19 @@
 [transport-udp]
 type=transport
 protocol=udp
-bind=0.0.0.0:5060
+; 對外(iPhone)的 transport:只綁 Tailscale 介面 IP(非 0.0.0.0),避免 SIP 暴露在實體
+; LAN/Wi-Fi/公網 → 擋 toll fraud 掃描。docker-compose 用 host network,此 IP = 本機
+; tailscale0 的位址。若 Tailscale IP 變動,改這裡 + 重跑 render-config.sh + restart asterisk。
+bind=__TAILSCALE_IP__:5060
+; 告訴 Asterisk 哪個外部網段算自己人(Tailscale CGNAT 100.64.0.0/10)。
+local_net=100.64.0.0/10
+
+; 本機 transport:baresip(6001)在同機 127.0.0.1,需要一個 loopback transport 連得到。
+; loopback 不對外,無暴露風險。與對外 transport 同 port 5060 但不同 bind IP(可共存)。
+[transport-udp-local]
+type=transport
+protocol=udp
+bind=127.0.0.1:5060
 
 [endpoint-tpl](!)
 type=endpoint
@@ -47,3 +59,12 @@ username=6002
 password=__SIP_IPHONE_PASS__
 
 [6002](aor-tpl)
+
+; 全域 SIP ACL(pjsip 的 type=acl section 會自動套用成全域來源過濾,不需掛 endpoint)。
+; 只放行:本機 loopback(baresip 6001,源為 127.0.0.1)+ Tailscale 網段(iPhone 6002)。
+; 擋掉實體 LAN/公網掃描器冒用分機(toll fraud)。auth(密碼)仍為主要身分驗證,ACL 是來源層。
+[acl-sources]
+type=acl
+deny=0.0.0.0/0
+permit=127.0.0.0/8
+permit=100.64.0.0/10

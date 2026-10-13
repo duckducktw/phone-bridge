@@ -141,9 +141,15 @@ def save_last(mid):
 
 
 def baseline():
-    """首次啟動：記住當前最新訊息 id，避免回頭處理歷史訊息。"""
+    """首次啟動：記住當前最新訊息 id，避免回頭處理歷史訊息。
+    空頻道時不能存 "0"(Discord after=0 會從頻道最初開始抓),改用「當下時間」的
+    snowflake,確保後續 after= 不會回頭抓到舊訊息。"""
     st, msgs = http_json("GET", f"{API}/channels/{CHANNEL_ID}/messages?limit=1", DH)
-    last = msgs[0]["id"] if msgs else "0"
+    if msgs:
+        last = msgs[0]["id"]
+    else:
+        # Discord snowflake = (毫秒 - 1420070400000) << 22
+        last = str((int(time.time() * 1000) - 1420070400000) << 22)
     save_last(last)
     return last
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=bridge-glue baresip<->oFono dial glue
+After=phone-baresip.service
+Wants=phone-baresip.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 8
+ExecStart=/usr/bin/python3 %h/projects/phone-bridge/voip/bridge-glue.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
