@@ -7,3 +7,28 @@ services:
     volumes:
       - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
       - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+
+  # 推播閘道:iPhone 在背景/鎖屏時用 Linphone 官方推播叫醒 App(見 flexisip/)
+  flexisip:
+    build: ./flexisip/build
+    image: local/flexisip:2.6.1-patched
+    container_name: phone-bridge-flexisip
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    depends_on: [asterisk, flexisip-tls]
+    volumes:
+      - ./flexisip/flexisip.conf:/etc/flexisip/flexisip.conf:ro
+      - ./flexisip/routes.conf:/etc/flexisip/routes.conf:ro
+      - ./flexisip/logs:/var/opt/belledonne-communications/log/flexisip
+    command: ["--server", "proxy"]
+
+  # Flexisip 規定 FlexiAPI 必須 https/h2 → 本機自簽 TLS 反代到 push_router(systemd user service)
+  flexisip-tls:
+    image: nginx:alpine
+    container_name: phone-bridge-flexisip-tls
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./flexisip/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./flexisip/tls:/etc/nginx/tls:ro

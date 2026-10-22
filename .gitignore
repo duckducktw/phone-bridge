@@ -10,3 +10,10 @@ config.env
 .state.json
 __pycache__/
 *.pyc
+# Flexisip 推播閘道:由 render-config.sh 生成(含內部金鑰/IP)、執行期產物
+voip/flexisip/flexisip.conf
+voip/flexisip/routes.conf
+voip/flexisip/tls/
+voip/flexisip/logs/
+voip/flexisip/.linphone-api-key
+voip/flexisip/build/flexisip.tgz

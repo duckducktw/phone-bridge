@@ -1,15 +1,6 @@
-[transport-udp]
-type=transport
-protocol=udp
-; 對外(iPhone)的 transport:只綁 Tailscale 介面 IP(非 0.0.0.0),避免 SIP 暴露在實體
-; LAN/Wi-Fi/公網 → 擋 toll fraud 掃描。docker-compose 用 host network,此 IP = 本機
-; tailscale0 的位址。若 Tailscale IP 變動,改這裡 + 重跑 render-config.sh + restart asterisk。
-bind=__TAILSCALE_IP__:5060
-; 告訴 Asterisk 哪個外部網段算自己人(Tailscale CGNAT 100.64.0.0/10)。
-local_net=100.64.0.0/10
-
-; 本機 transport:baresip(6001)在同機 127.0.0.1,需要一個 loopback transport 連得到。
-; loopback 不對外,無暴露風險。與對外 transport 同 port 5060 但不同 bind IP(可共存)。
+; 對外(iPhone)改由 Flexisip 推播閘道接(__TAILSCALE_IP__:5060,見 flexisip/),
+; Asterisk 只綁 loopback:iPhone 的 REGISTER/INVITE 都經 Flexisip 轉進來,
+; baresip(6001)也在同機 127.0.0.1。對外完全不監聽 → 無 toll fraud 暴露面。
 [transport-udp-local]
 type=transport
 protocol=udp
@@ -53,12 +44,20 @@ password=__SIP_BARESIP_PASS__
 auth=6002-auth
 aors=6002
 callerid=iPhone <6002>
+; Contact 已被 Flexisip 換成自己(含 CtRt 路由參數),別再依封包來源改寫
+rewrite_contact=no
 
 [6002-auth](auth-tpl)
 username=6002
 password=__SIP_IPHONE_PASS__
 
 [6002](aor-tpl)
+; Flexisip 會加 Path 頭,但官方 Linphone 不宣告 Supported: path → 不關會回 420
+support_path=no
+; iOS 推播:Flexisip 每 30 分鐘用背景推播叫 App 續約,註冊可放長
+default_expiration=604800
+maximum_expiration=604800
+remove_unavailable=no
 
 ; 全域 SIP ACL(pjsip 的 type=acl section 會自動套用成全域來源過濾,不需掛 endpoint)。
 ; 只放行:本機 loopback(baresip 6001,源為 127.0.0.1)+ Tailscale 網段(iPhone 6002)。

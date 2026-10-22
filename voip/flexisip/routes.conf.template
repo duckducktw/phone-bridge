@@ -1,0 +1,2 @@
+# iPhone 送來、目標是本網域的請求(REGISTER、撥外線 INVITE 等)一律轉給 Asterisk 的 loopback transport
+<sip:127.0.0.1:5060;transport=udp> is_request && (request.uri.domain == '__TAILSCALE_IP__')

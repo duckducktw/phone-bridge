@@ -1,0 +1,13 @@
+[Unit]
+Description=Linphone push router (Flexisip external-push → subscribe.linphone.org)
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/projects/phone-bridge/voip/.sip-secrets.env
+ExecStart=/usr/bin/python3 %h/projects/phone-bridge/voip/flexisip/push_router.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

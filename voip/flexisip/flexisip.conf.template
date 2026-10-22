@@ -1,0 +1,69 @@
+; Flexisip 推播閘道(放在 Asterisk 前面,讓官方 Linphone iOS 在背景/鎖屏也能被來電叫醒)
+;
+;   iPhone ──REGISTER/INVITE──> Flexisip(__TAILSCALE_IP__:5060) ──> Asterisk(127.0.0.1:5060)
+;   Asterisk 撥 6002 ──INVITE──> Flexisip(127.0.0.1:5080) ──Router──> iPhone
+;                                  └─ iPhone 不在線 → external-push-flexiapi → nginx(h2,127.0.0.1:8443)
+;                                     → push_router.py(127.0.0.1:8090) → subscribe.linphone.org → APNs
+;
+; 參考:sparkcyf/linphone-asterisk-sip-push-gw-work-log(Flexisip 2.6.1 + 寬鬆 pn-prid 補丁)
+[global]
+; 別放 127.0.0.1:Asterisk 也在 127.0.0.1(:5060),會被當成自己 → 482 Loop Detected
+aliases=localhost __TAILSCALE_IP__
+transports=sip:__TAILSCALE_IP__:5060;transport=udp sip:__TAILSCALE_IP__:5060;transport=tcp sip:127.0.0.1:5080;transport=udp
+log-level=message
+syslog-level=error
+user-errors-logs=true
+show-body-for=false
+
+[global::flexiapi]
+; Flexisip 規定必須 https:nginx 自簽 TLS + h2 反代到 push_router(Flexisip 不驗證書)
+url=https://127.0.0.1:8443
+api-key=__ROUTER_KEY__
+
+[module::DoSProtection]
+; 容器無 NET_ADMIN;來源過濾由 Asterisk ACL + 只綁 Tailscale/loopback 負責
+enabled=false
+
+[module::Authentication]
+; 帳密驗證交給後面的 Asterisk
+enabled=false
+
+[module::Registrar]
+enabled=true
+reg-domains=*
+; Asterisk 驗證通過(200)才記住 iPhone 的 Contact 與推播參數
+reg-on-response=true
+db-implementation=internal
+max-expires=604800
+default-expires=3600s
+
+[module::Router]
+; Flexisip 2.6 用 CtRt 參數標記「回頭找已註冊 Contact」的請求(舊版是 doroute)
+filter=(is_request && (request.uri.params contains 'doroute' || request.uri.params contains 'CtRt')) || is_response
+use-global-domain=true
+; 推播叫醒 App 後,App 重新 REGISTER,再把等待中的 INVITE 送過去
+fork-late=true
+
+[module::PushNotification]
+enabled=true
+apple=false
+firebase=false
+external-push-flexiapi=true
+; iOS 註冊快過期時發背景推播,讓 App 自己醒來續約(不必打開 App)
+register-wakeup-interval=30
+register-wakeup-threshold=50
+; 只需要來電推播;關掉 MWI NOTIFY 觸發的訊息推播(會造成 25 秒一次的註冊迴圈)
+enable-message-summaries-pn=false
+
+[module::ContactRouteInserter]
+; 把轉給 Asterisk 的 REGISTER Contact 換成 Flexisip 自己,Asterisk 撥 6002 就會先打到這裡
+enabled=true
+insert-domain=true
+
+[module::MediaRelay]
+; 全程 Tailscale 直連,媒體不需中繼
+enabled=false
+
+[module::Forward]
+enabled=true
+routes-config-path=/etc/flexisip/routes.conf
