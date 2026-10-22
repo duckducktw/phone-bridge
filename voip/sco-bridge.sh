@@ -34,21 +34,20 @@ SYNC=5        # auto:自動選 captshift/playshift 做時脈同步
 
 log(){ echo "[sco-bridge] $*"; }
 
-uplink(){   # baresip→手機: 讀 loopback 1,0 → 寫 SCO sink
-  while :; do
-    alsaloop -C hw:PBLoop,1,0 -P "$SCO" -r $RATE -n -f $FMT -c $CH -S $SYNC -t $TLAT 2>"$ERR"
-    sleep 0.5
-  done
-}
-downlink(){ # 手機→baresip: 讀 SCO source → 寫 loopback 1,1
-  while :; do
-    alsaloop -C "$SCO" -P hw:PBLoop,1,1 -r $RATE -n -f $FMT -c $CH -S $SYNC -t $TLAT 2>"$ERR"
-    sleep 0.5
-  done
-}
-
+# 上下行必須「成對」生死:SCO 斷線(藍牙重連/transport 重建)時,下行 capture 會收 EOF
+# 退出,但上行 playback 寫 SCO sink 不會報錯,會黏在舊 transport 上永遠靜音(實測:上行
+# alsaloop 活了 8 天,之後每通電話對方都聽不到你)。故任一支退出就砍另一支,整對重開。
 trap 'kill 0' EXIT INT TERM
 log "start (SCO=$MAC, loop=PBLoop, loop=$RATE Hz, SCO codec=CVSD, alsaloop -n resample, sync=$SYNC)"
-uplink &
-downlink &
-wait
+while :; do
+  # 上行 baresip→手機: 讀 loopback 1,0 → 寫 SCO sink
+  alsaloop -C hw:PBLoop,1,0 -P "$SCO" -r $RATE -n -f $FMT -c $CH -S $SYNC -t $TLAT 2>"$ERR" &
+  up=$!
+  # 下行 手機→baresip: 讀 SCO source → 寫 loopback 1,1
+  alsaloop -C "$SCO" -P hw:PBLoop,1,1 -r $RATE -n -f $FMT -c $CH -S $SYNC -t $TLAT 2>"$ERR" &
+  down=$!
+  wait -n "$up" "$down"
+  kill "$up" "$down" 2>/dev/null
+  wait "$up" "$down" 2>/dev/null
+  sleep 0.5
+done
